@@ -914,6 +914,7 @@ K_THREAD_DEFINE(workq_tid, WORKQ_STACK,
 		WORKQ_PRIO, 0, 3000);
 */
 
+/* I2C sensors disabled — focusing on BNO085 SPI
 K_THREAD_DEFINE(shtc3_tid, SHTC3_STACK,
 		shtc3_task, NULL, NULL, NULL,
 		SHTC3_PRIO, 0, 1000);
@@ -921,6 +922,7 @@ K_THREAD_DEFINE(shtc3_tid, SHTC3_STACK,
 K_THREAD_DEFINE(opt4048_tid, OPT4048_STACK,
 		opt4048_task, NULL, NULL, NULL,
 		OPT4048_PRIO, 0, 1000);
+*/
 
 K_THREAD_DEFINE(bno085_tid, BNO085_STACK,
 		bno085_task, NULL, NULL, NULL,

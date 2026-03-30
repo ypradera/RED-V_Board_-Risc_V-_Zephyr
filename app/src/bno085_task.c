@@ -50,7 +50,7 @@ static struct spi_config bno_spi_cfg = {
 	.cs = { .gpio = { 0 } },  /* Use hardware CS (GPIO 2 via IOF) */
 };
 
-/* ---- SPI read/write helpers ---- */
+/* ---- SPI helpers ---- */
 
 static int bno_spi_read(uint8_t *buf, uint16_t len)
 {
@@ -152,9 +152,14 @@ static int bno_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
 	return packet_len;
 }
 
+static uint32_t write_count;
+
 static int bno_hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
 {
-	if (bno_spi_write(pBuffer, len) != 0) {
+	write_count++;
+	int ret = bno_spi_write(pBuffer, len);
+	if (ret != 0) {
+		printk("[bno085] SPI write failed: %d (len=%d)\n", ret, len);
 		return 0;
 	}
 	return len;
@@ -170,10 +175,18 @@ static uint32_t bno_hal_getTimeUs(sh2_Hal_t *self)
 static volatile bool sensor_data_ready;
 static sh2_SensorValue_t latest_value;
 
+static volatile bool needs_report_setup;
+static volatile bool init_complete;
+
 static void sh2_event_callback(void *cookie, sh2_AsyncEvent_t *pEvent)
 {
 	if (pEvent->eventId == SH2_RESET) {
-		printk("[bno085] Reset detected\n");
+		if (init_complete) {
+			printk("[bno085] Reset detected — will re-enable reports\n");
+			needs_report_setup = true;
+		} else {
+			printk("[bno085] Initial reset (expected)\n");
+		}
 	}
 }
 
@@ -246,25 +259,84 @@ void bno085_task(void *p1, void *p2, void *p3)
 	printk("[bno085] Gravity vector:                %s\n",
 	       rc == SH2_OK ? "OK" : "FAIL");
 
+	needs_report_setup = false;
+	init_complete = true;
 	printk("[bno085] Reading IMU data...\n");
 
+	/* Track data flow to detect stalls */
+	uint32_t last_data_count = 0;
+	int64_t last_data_time = k_uptime_get();
+
 	uint32_t service_count = 0;
+	uint32_t data_count = 0;
 	uint32_t last_print = 0;
 
 	while (1) {
+		/* Re-enable reports after a BNO085 reset */
+		if (needs_report_setup) {
+			needs_report_setup = false;
+			printk("[bno085] Re-enabling reports after reset...\n");
+			k_msleep(100);
+			enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
+			enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
+			enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
+			enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
+			printk("[bno085] Reports re-enabled\n");
+		}
+
+		/* Service aggressively — process multiple packets per loop */
 		sh2_service();
 		service_count++;
 
-		/* Print heartbeat every 5 seconds so we know the task is alive */
+		/* Print heartbeat every 10 seconds */
 		uint32_t now = (uint32_t)(k_uptime_get() / 1000);
-		if (now != last_print && (now % 5) == 0) {
+		if (now != last_print && (now % 10) == 0) {
 			last_print = now;
-			printk("[bno085] alive: %u services, INT=%d\n",
-			       service_count,
+			printk("[bno085] alive: svc=%u data=%u wr=%u INT=%d\n",
+			       service_count, data_count, write_count,
 			       gpio_pin_get(gpio_dev, BNO_INT_PIN));
 		}
 
+		/* Detect data stall — if no new data for 3 seconds, reset BNO085 */
+		if (data_count > last_data_count) {
+			last_data_count = data_count;
+			last_data_time = k_uptime_get();
+		} else if ((k_uptime_get() - last_data_time) > 3000 && data_count > 0) {
+			printk("[bno085] Data stall detected — resetting...\n");
+
+			sh2_close();
+
+			/* Hardware reset */
+			gpio_pin_set(gpio_dev, BNO_RST_PIN, 0);
+			k_msleep(10);
+			gpio_pin_set(gpio_dev, BNO_RST_PIN, 1);
+			k_msleep(300);
+
+			init_complete = false;
+			needs_report_setup = false;
+
+			rc = sh2_open(&bno_hal, sh2_event_callback, NULL);
+			if (rc != SH2_OK) {
+				printk("[bno085] Re-open failed: %d\n", rc);
+				k_msleep(1000);
+				continue;
+			}
+
+			sh2_setSensorCallback(sh2_sensor_callback, NULL);
+			enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
+			enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
+			enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
+			enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
+
+			init_complete = true;
+			last_data_count = data_count;
+			last_data_time = k_uptime_get();
+			write_count = 0;
+			printk("[bno085] Reset complete, reports re-enabled\n");
+		}
+
 		if (sensor_data_ready) {
+			data_count++;
 			sensor_data_ready = false;
 
 			switch (latest_value.sensorId) {

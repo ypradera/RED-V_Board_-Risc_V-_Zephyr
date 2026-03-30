@@ -1,16 +1,17 @@
 /*
  * Overlay for SparkFun RED-V RedBoard
- * Disables SPI1/SPI2 to free GPIO 5 for LED.
+ *
+ * SPI1 enabled for BNO085 IMU.
+ * NOTE: GPIO 5 (LED) is shared with SPI1 SCK — no LED when SPI active.
  */
-/ {
-	leds {
-		compatible = "gpio-leds";
-		led0: led_0 {
-			gpios = <&gpio0 5 GPIO_ACTIVE_HIGH>;
-			label = "RED-V Built-in LED";
-		};
-	};
+
+&spi1 {
+	status = "okay";
+	pinctrl-0 = <&spi1_cs0_default
+		     &spi1_mosi_default
+		     &spi1_miso_default
+		     &spi1_sck_default>;
+	pinctrl-names = "default";
 };
 
-&spi1 { status = "disabled"; };
 &spi2 { status = "disabled"; };

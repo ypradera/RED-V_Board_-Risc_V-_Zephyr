@@ -1,14 +1,21 @@
 /*
- * BNO085 IMU Task — reads rotation vector (quaternion) data
+ * BNO085 IMU Task — SPI mode
  *
  * Uses the CEVA SH-2 library for SHTP protocol handling.
- * Implements the SH-2 HAL interface using Zephyr's I2C API
- * with FE310 workarounds (address shift + controller re-init).
+ * SPI eliminates the 1.7s clock stretching issue seen with I2C.
+ *
+ * Wiring (RED-V header pins):
+ *   D10 (GPIO 2) → CS
+ *   D11 (GPIO 3) → MOSI (SDA/SDI on BNO085)
+ *   D12 (GPIO 4) → MISO (SDO/ADO on BNO085)
+ *   D13 (GPIO 5) → SCK  (SCL on BNO085)
+ *   BNO085 PS0   → 3.3V (SPI mode select)
+ *   BNO085 PS1   → GND  (SPI mode select)
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 
@@ -16,68 +23,60 @@
 #include "sh2_err.h"
 #include "sh2_SensorValue.h"
 
-/* ---- FE310 I2C workarounds (shared with main.c) ---- */
+/* SPI device: SPI1 on the FE310 */
+static const struct device *spi_dev;
 
-/* BNO085 7-bit I2C address */
-#define BNO085_ADDR_7BIT  0x4A
-#define BNO085_ADDR_WIRE  (BNO085_ADDR_7BIT << 1)
+static struct spi_config bno_spi_cfg = {
+	.frequency = 3000000,  /* 3 MHz */
+	.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) |
+		     SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_TRANSFER_MSB,
+	.slave = 0,
+	.cs = { .gpio = { 0 } },  /* Use hardware CS (GPIO 2 via IOF) */
+};
 
-/* FE310 I2C controller re-init (same as main.c) */
-#define I2C0_BASE  0x10016000
+/* ---- SPI read/write helpers ---- */
 
-static void bno_i2c_reinit(void)
+static int bno_spi_read(uint8_t *buf, uint16_t len)
 {
-	volatile uint8_t *base = (volatile uint8_t *)I2C0_BASE;
-	base[0x08] = 0x00;
-	k_busy_wait(10);
-	base[0x00] = 0x1F;
-	base[0x04] = 0x00;
-	base[0x08] = 0x80;
-	k_busy_wait(10);
+	struct spi_buf rx = {.buf = buf, .len = len};
+	struct spi_buf_set rx_set = {.buffers = &rx, .count = 1};
+	return spi_read(spi_dev, &bno_spi_cfg, &rx_set);
 }
 
-/* External: shared I2C bus mutex from main.c */
-extern struct k_mutex i2c_bus_mutex;
-
-/* I2C device handle */
-static const struct device *bno_i2c;
+static int bno_spi_write(uint8_t *buf, uint16_t len)
+{
+	struct spi_buf tx = {.buf = buf, .len = len};
+	struct spi_buf_set tx_set = {.buffers = &tx, .count = 1};
+	return spi_write(spi_dev, &bno_spi_cfg, &tx_set);
+}
 
 /* ---- SH-2 HAL Implementation ---- */
 
 static int bno_hal_open(sh2_Hal_t *self)
 {
-	/* I2C is already initialized by the sensor task in main.c */
-	bno_i2c = DEVICE_DT_GET(DT_NODELABEL(i2c0));
-	if (!device_is_ready(bno_i2c)) {
+	spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi1));
+	if (!device_is_ready(spi_dev)) {
+		printk("[bno085] SPI1 not ready!\n");
 		return SH2_ERR;
 	}
 
-	/* Wait for BNO085 to boot */
-	k_msleep(300);
-
+	printk("[bno085] SPI1 ready, waiting for BNO085 boot...\n");
+	k_msleep(500);
 	return SH2_OK;
 }
 
 static void bno_hal_close(sh2_Hal_t *self)
 {
-	/* Nothing to do */
 }
 
 static int bno_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
 			uint32_t *t_us)
 {
-	/* Read 4-byte SHTP header first */
-	uint8_t hdr[4];
-
-	bno_i2c_reinit();
-	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
-	int ret = i2c_read(bno_i2c, hdr, 4, BNO085_ADDR_WIRE);
-	k_mutex_unlock(&i2c_bus_mutex);
-	k_busy_wait(100);
-
-	if (ret != 0) {
-		k_msleep(10); /* Yield to other tasks */
-		return 0; /* No data */
+	/* Read 4-byte SHTP header */
+	uint8_t hdr[4] = {0};
+	if (bno_spi_read(hdr, 4) != 0) {
+		k_msleep(10);
+		return 0;
 	}
 
 	/* Parse packet length (little-endian, mask continuation bit) */
@@ -85,22 +84,16 @@ static int bno_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
 	packet_len &= 0x7FFF;
 
 	if (packet_len == 0 || packet_len == 0x7FFF) {
-		k_msleep(10); /* Yield to other tasks */
-		return 0; /* No data available */
+		k_msleep(10);
+		return 0;
 	}
 
 	if (packet_len > len) {
 		packet_len = len;
 	}
 
-	/* Read full packet (BNO085 re-sends header + payload) */
-	bno_i2c_reinit();
-	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
-	ret = i2c_read(bno_i2c, pBuffer, packet_len, BNO085_ADDR_WIRE);
-	k_mutex_unlock(&i2c_bus_mutex);
-	k_busy_wait(100);
-
-	if (ret != 0) {
+	/* Read full packet */
+	if (bno_spi_read(pBuffer, packet_len) != 0) {
 		return 0;
 	}
 
@@ -110,13 +103,7 @@ static int bno_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
 
 static int bno_hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
 {
-	bno_i2c_reinit();
-	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
-	int ret = i2c_write(bno_i2c, pBuffer, len, BNO085_ADDR_WIRE);
-	k_mutex_unlock(&i2c_bus_mutex);
-	k_busy_wait(100);
-
-	if (ret != 0) {
+	if (bno_spi_write(pBuffer, len) != 0) {
 		return 0;
 	}
 	return len;
@@ -129,14 +116,13 @@ static uint32_t bno_hal_getTimeUs(sh2_Hal_t *self)
 
 /* ---- SH-2 Callbacks ---- */
 
-static volatile bool sh2_reset_occurred;
 static volatile bool sensor_data_ready;
 static sh2_SensorValue_t latest_value;
 
 static void sh2_event_callback(void *cookie, sh2_AsyncEvent_t *pEvent)
 {
 	if (pEvent->eventId == SH2_RESET) {
-		sh2_reset_occurred = true;
+		printk("[bno085] Reset detected\n");
 	}
 }
 
@@ -146,20 +132,10 @@ static void sh2_sensor_callback(void *cookie, sh2_SensorEvent_t *pEvent)
 	sensor_data_ready = true;
 }
 
-/* ---- Enable a sensor report ---- */
-
 static int enable_report(uint8_t sensor_id, uint32_t interval_us)
 {
-	sh2_SensorConfig_t config = {
-		.changeSensitivityEnabled = false,
-		.wakeupEnabled = false,
-		.changeSensitivityRelative = false,
-		.alwaysOnEnabled = false,
-		.changeSensitivity = 0,
-		.reportInterval_us = interval_us,
-		.batchInterval_us = 0,
-		.sensorSpecific = 0,
-	};
+	sh2_SensorConfig_t config = {0};
+	config.reportInterval_us = interval_us;
 	return sh2_setSensorConfig(sensor_id, &config);
 }
 
@@ -168,26 +144,22 @@ static int enable_report(uint8_t sensor_id, uint32_t interval_us)
 void bno085_task(void *p1, void *p2, void *p3)
 {
 	static sh2_Hal_t bno_hal;
-	int rc;
 
-	printk("[bno085] Starting...\n");
+	printk("[bno085] Starting (SPI mode)...\n");
 
-	/* Set up HAL */
 	bno_hal.open      = bno_hal_open;
 	bno_hal.close     = bno_hal_close;
 	bno_hal.read      = bno_hal_read;
 	bno_hal.write     = bno_hal_write;
 	bno_hal.getTimeUs = bno_hal_getTimeUs;
 
-	/* Open SH-2 connection */
-	rc = sh2_open(&bno_hal, sh2_event_callback, NULL);
+	int rc = sh2_open(&bno_hal, sh2_event_callback, NULL);
 	if (rc != SH2_OK) {
 		printk("[bno085] sh2_open failed: %d\n", rc);
 		return;
 	}
-	printk("[bno085] SH-2 connected!\n");
+	printk("[bno085] SH-2 connected via SPI!\n");
 
-	/* Read product IDs */
 	sh2_ProductIds_t prodIds;
 	rc = sh2_getProdIds(&prodIds);
 	if (rc == SH2_OK && prodIds.numEntries > 0) {
@@ -197,48 +169,41 @@ void bno085_task(void *p1, void *p2, void *p3)
 		       prodIds.entry[0].swVersionPatch);
 	}
 
-	/* Register sensor callback */
 	sh2_setSensorCallback(sh2_sensor_callback, NULL);
 
-	/* Enable rotation vector at 10 Hz (100ms = 100000us) */
 	rc = enable_report(SH2_ROTATION_VECTOR, 100000);
-	if (rc != SH2_OK) {
-		printk("[bno085] Failed to enable rotation vector: %d\n", rc);
-	} else {
-		printk("[bno085] Rotation vector enabled at 10 Hz\n");
+	if (rc == SH2_OK) {
+		printk("[bno085] Rotation vector at 10 Hz\n");
 	}
 
-	/* Enable accelerometer at 10 Hz */
 	enable_report(SH2_ACCELEROMETER, 100000);
 
 	printk("[bno085] Reading IMU data...\n");
 
 	while (1) {
-		/* Service the SH-2 library (processes incoming SHTP packets) */
 		sh2_service();
 
 		if (sensor_data_ready) {
 			sensor_data_ready = false;
 
 			if (latest_value.sensorId == SH2_ROTATION_VECTOR) {
-				/* Quaternion: i, j, k, real */
 				int32_t qi = (int32_t)(latest_value.un.rotationVector.i * 10000);
 				int32_t qj = (int32_t)(latest_value.un.rotationVector.j * 10000);
 				int32_t qk = (int32_t)(latest_value.un.rotationVector.k * 10000);
 				int32_t qr = (int32_t)(latest_value.un.rotationVector.real * 10000);
 
-				printk("[bno085] Quat: i=%d j=%d k=%d r=%d (x10000)\n",
+				printk("[bno085] Quat: i=%d j=%d k=%d r=%d\n",
 				       qi, qj, qk, qr);
 			} else if (latest_value.sensorId == SH2_ACCELEROMETER) {
 				int32_t ax = (int32_t)(latest_value.un.accelerometer.x * 100);
 				int32_t ay = (int32_t)(latest_value.un.accelerometer.y * 100);
 				int32_t az = (int32_t)(latest_value.un.accelerometer.z * 100);
 
-				printk("[bno085] Accel: x=%d y=%d z=%d (x100 m/s2)\n",
+				printk("[bno085] Accel: x=%d y=%d z=%d\n",
 				       ax, ay, az);
 			}
 		}
 
-		k_msleep(10); /* Service at ~100 Hz */
+		k_msleep(10);
 	}
 }

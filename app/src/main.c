@@ -878,9 +878,11 @@ void opt4048_task(void *p1, void *p2, void *p3)
  * Uncomment them when not using sensors (set active_groups = PG_RTOS).
  */
 
+/* LED disabled — GPIO 5 is now SPI1 SCK for BNO085
 K_THREAD_DEFINE(blink_tid, BLINK_STACK,
 		blink_task, NULL, NULL, NULL,
 		BLINK_PRIO, 0, 0);
+*/
 
 /*
 K_THREAD_DEFINE(counter_tid, COUNTER_STACK,

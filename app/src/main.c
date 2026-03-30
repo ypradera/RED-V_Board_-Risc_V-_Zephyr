@@ -922,8 +922,6 @@ K_THREAD_DEFINE(opt4048_tid, OPT4048_STACK,
 		opt4048_task, NULL, NULL, NULL,
 		OPT4048_PRIO, 0, 1000);
 
-/* BNO085: Works over I2C but clock stretching (~1.7s) blocks the bus.
- * For production use SPI instead. Enabled for testing. */
 K_THREAD_DEFINE(bno085_tid, BNO085_STACK,
 		bno085_task, NULL, NULL, NULL,
 		BNO085_PRIO, 0, 1500);

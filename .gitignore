@@ -7,3 +7,4 @@ build/
 *.map
 __pycache__/
 .vscode/
+*.sal

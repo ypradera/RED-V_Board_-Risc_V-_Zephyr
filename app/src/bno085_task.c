@@ -16,15 +16,31 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
+#include <string.h>
 
 #include "sh2.h"
 #include "sh2_err.h"
 #include "sh2_SensorValue.h"
 
+/*
+ * Pin mapping (RED-V silkscreen → FE310 GPIO):
+ *   "8"  = GPIO 0 = RST
+ *   "9"  = GPIO 1 = INT
+ *   "10" = GPIO 2 = CS  (SPI1 CS0 via IOF)
+ *   "11" = GPIO 3 = MOSI (SPI1 DQ0 via IOF)
+ *   "12" = GPIO 4 = MISO (SPI1 DQ1 via IOF)
+ *   "13" = GPIO 5 = SCK  (SPI1 SCK via IOF)
+ */
+#define BNO_RST_PIN  0   /* GPIO 0 = RED-V "8" */
+#define BNO_INT_PIN  1   /* GPIO 1 = RED-V "9" */
+#define GPIO_BASE_ADDR 0x10012000
+
 /* SPI device: SPI1 on the FE310 */
 static const struct device *spi_dev;
+static const struct device *gpio_dev;
 
 static struct spi_config bno_spi_cfg = {
 	.frequency = 3000000,  /* 3 MHz */
@@ -60,8 +76,40 @@ static int bno_hal_open(sh2_Hal_t *self)
 		return SH2_ERR;
 	}
 
-	printk("[bno085] SPI1 ready, waiting for BNO085 boot...\n");
-	k_msleep(500);
+	gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	if (!device_is_ready(gpio_dev)) {
+		printk("[bno085] GPIO not ready!\n");
+		return SH2_ERR;
+	}
+
+	/* Configure RST as output, INT as input */
+	gpio_pin_configure(gpio_dev, BNO_RST_PIN, GPIO_OUTPUT_ACTIVE);
+	gpio_pin_configure(gpio_dev, BNO_INT_PIN, GPIO_INPUT | GPIO_PULL_UP);
+
+	printk("[bno085] SPI1 ready, resetting BNO085...\n");
+
+	/* Hardware reset sequence:
+	 *   RST LOW for 10ms → RST HIGH → wait for boot (~300ms)
+	 */
+	gpio_pin_set(gpio_dev, BNO_RST_PIN, 0);  /* Assert reset */
+	k_msleep(10);
+	gpio_pin_set(gpio_dev, BNO_RST_PIN, 1);  /* Release reset */
+	k_msleep(300);  /* Wait for BNO085 to boot */
+
+	/* Wait for INT to go low (BNO085 signals ready) */
+	printk("[bno085] Waiting for INT...\n");
+	int timeout = 100;  /* 100 * 10ms = 1 second max */
+	while (timeout-- > 0) {
+		if (gpio_pin_get(gpio_dev, BNO_INT_PIN) == 0) {
+			printk("[bno085] INT asserted — BNO085 ready!\n");
+			break;
+		}
+		k_msleep(10);
+	}
+	if (timeout <= 0) {
+		printk("[bno085] INT timeout (may still work)\n");
+	}
+
 	return SH2_OK;
 }
 
@@ -72,29 +120,32 @@ static void bno_hal_close(sh2_Hal_t *self)
 static int bno_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
 			uint32_t *t_us)
 {
-	/* Read 4-byte SHTP header */
-	uint8_t hdr[4] = {0};
-	if (bno_spi_read(hdr, 4) != 0) {
-		k_msleep(10);
+	/* Only read when INT is asserted (low) — BNO085 has data */
+	if (gpio_pin_get(gpio_dev, BNO_INT_PIN) != 0) {
+		k_msleep(1);
+		return 0;  /* No data ready */
+	}
+
+	/* Read full packet in one transaction.
+	 * SHTP over SPI: the first 4 bytes are the header,
+	 * followed by the payload. Read it all at once. */
+	uint16_t read_len = (len < 256) ? len : 256;
+	memset(pBuffer, 0, read_len);
+
+	if (bno_spi_read(pBuffer, read_len) != 0) {
 		return 0;
 	}
 
-	/* Parse packet length (little-endian, mask continuation bit) */
-	uint16_t packet_len = (uint16_t)(hdr[0] | (hdr[1] << 8));
+	/* Parse packet length from header */
+	uint16_t packet_len = (uint16_t)(pBuffer[0] | (pBuffer[1] << 8));
 	packet_len &= 0x7FFF;
 
 	if (packet_len == 0 || packet_len == 0x7FFF) {
-		k_msleep(10);
 		return 0;
 	}
 
-	if (packet_len > len) {
-		packet_len = len;
-	}
-
-	/* Read full packet */
-	if (bno_spi_read(pBuffer, packet_len) != 0) {
-		return 0;
+	if (packet_len > read_len) {
+		packet_len = read_len;
 	}
 
 	*t_us = (uint32_t)(k_uptime_get() * 1000);
@@ -162,45 +213,107 @@ void bno085_task(void *p1, void *p2, void *p3)
 
 	sh2_ProductIds_t prodIds;
 	rc = sh2_getProdIds(&prodIds);
-	if (rc == SH2_OK && prodIds.numEntries > 0) {
-		printk("[bno085] SW Version: %d.%d.%d\n",
-		       prodIds.entry[0].swVersionMajor,
-		       prodIds.entry[0].swVersionMinor,
-		       prodIds.entry[0].swVersionPatch);
+	if (rc == SH2_OK) {
+		printk("[bno085] Product entries: %d\n", prodIds.numEntries);
+		if (prodIds.numEntries > 0) {
+			printk("[bno085] SW Version: %d.%d.%d\n",
+			       prodIds.entry[0].swVersionMajor,
+			       prodIds.entry[0].swVersionMinor,
+			       prodIds.entry[0].swVersionPatch);
+		}
+	} else {
+		printk("[bno085] getProdIds failed: %d\n", rc);
 	}
 
 	sh2_setSensorCallback(sh2_sensor_callback, NULL);
 
-	rc = enable_report(SH2_ROTATION_VECTOR, 100000);
-	if (rc == SH2_OK) {
-		printk("[bno085] Rotation vector at 10 Hz\n");
-	}
+	/* Enable biomechanics sensor suite at 50 Hz (20ms = 20000us) */
+	#define BIO_INTERVAL_US  20000  /* 50 Hz */
 
-	enable_report(SH2_ACCELEROMETER, 100000);
+	rc = enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
+	printk("[bno085] Rotation vector (orientation): %s\n",
+	       rc == SH2_OK ? "OK" : "FAIL");
+
+	rc = enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
+	printk("[bno085] Gyroscope (angular velocity):  %s\n",
+	       rc == SH2_OK ? "OK" : "FAIL");
+
+	rc = enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
+	printk("[bno085] Linear accel (no gravity):     %s\n",
+	       rc == SH2_OK ? "OK" : "FAIL");
+
+	rc = enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
+	printk("[bno085] Gravity vector:                %s\n",
+	       rc == SH2_OK ? "OK" : "FAIL");
 
 	printk("[bno085] Reading IMU data...\n");
 
+	uint32_t service_count = 0;
+	uint32_t last_print = 0;
+
 	while (1) {
 		sh2_service();
+		service_count++;
+
+		/* Print heartbeat every 5 seconds so we know the task is alive */
+		uint32_t now = (uint32_t)(k_uptime_get() / 1000);
+		if (now != last_print && (now % 5) == 0) {
+			last_print = now;
+			printk("[bno085] alive: %u services, INT=%d\n",
+			       service_count,
+			       gpio_pin_get(gpio_dev, BNO_INT_PIN));
+		}
 
 		if (sensor_data_ready) {
 			sensor_data_ready = false;
 
-			if (latest_value.sensorId == SH2_ROTATION_VECTOR) {
+			switch (latest_value.sensorId) {
+			case SH2_ROTATION_VECTOR: {
+				/* Quaternion: orientation in 3D space
+				 * Values: -1.0 to 1.0, scaled x10000 */
 				int32_t qi = (int32_t)(latest_value.un.rotationVector.i * 10000);
 				int32_t qj = (int32_t)(latest_value.un.rotationVector.j * 10000);
 				int32_t qk = (int32_t)(latest_value.un.rotationVector.k * 10000);
 				int32_t qr = (int32_t)(latest_value.un.rotationVector.real * 10000);
+				int32_t acc = (int32_t)(latest_value.un.rotationVector.accuracy * 100);
 
-				printk("[bno085] Quat: i=%d j=%d k=%d r=%d\n",
-				       qi, qj, qk, qr);
-			} else if (latest_value.sensorId == SH2_ACCELEROMETER) {
-				int32_t ax = (int32_t)(latest_value.un.accelerometer.x * 100);
-				int32_t ay = (int32_t)(latest_value.un.accelerometer.y * 100);
-				int32_t az = (int32_t)(latest_value.un.accelerometer.z * 100);
+				printk("[imu] Quat: i=%d j=%d k=%d r=%d acc=%d\n",
+				       qi, qj, qk, qr, acc);
+				break;
+			}
+			case SH2_GYROSCOPE_CALIBRATED: {
+				/* Angular velocity in rad/s, scaled x100 */
+				int32_t gx = (int32_t)(latest_value.un.gyroscope.x * 100);
+				int32_t gy = (int32_t)(latest_value.un.gyroscope.y * 100);
+				int32_t gz = (int32_t)(latest_value.un.gyroscope.z * 100);
 
-				printk("[bno085] Accel: x=%d y=%d z=%d\n",
-				       ax, ay, az);
+				printk("[imu] Gyro: x=%d y=%d z=%d (x100 rad/s)\n",
+				       gx, gy, gz);
+				break;
+			}
+			case SH2_LINEAR_ACCELERATION: {
+				/* Acceleration without gravity in m/s^2, scaled x100 */
+				int32_t lx = (int32_t)(latest_value.un.linearAcceleration.x * 100);
+				int32_t ly = (int32_t)(latest_value.un.linearAcceleration.y * 100);
+				int32_t lz = (int32_t)(latest_value.un.linearAcceleration.z * 100);
+
+				printk("[imu] LinAcc: x=%d y=%d z=%d (x100 m/s2)\n",
+				       lx, ly, lz);
+				break;
+			}
+			case SH2_GRAVITY: {
+				/* Gravity direction in m/s^2, scaled x100
+				 * At rest: should read ~0,0,981 (9.81 m/s^2 down) */
+				int32_t gvx = (int32_t)(latest_value.un.gravity.x * 100);
+				int32_t gvy = (int32_t)(latest_value.un.gravity.y * 100);
+				int32_t gvz = (int32_t)(latest_value.un.gravity.z * 100);
+
+				printk("[imu] Grav: x=%d y=%d z=%d (x100 m/s2)\n",
+				       gvx, gvy, gvz);
+				break;
+			}
+			default:
+				break;
 			}
 		}
 

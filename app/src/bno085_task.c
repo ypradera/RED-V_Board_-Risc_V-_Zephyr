@@ -50,10 +50,41 @@ static struct spi_config bno_spi_cfg = {
 	.cs = { .gpio = { 0 } },  /* Use hardware CS (GPIO 2 via IOF) */
 };
 
-/* ---- SPI helpers ---- */
+/* ---- SPI helpers (full-duplex) ----
+ *
+ * BNO085 SHTP over SPI is full-duplex: the sensor sends data on MISO
+ * even during host writes. We must capture this data or the SHTP
+ * flow control breaks and the sensor stops sending after ~5 seconds.
+ *
+ * The SiFive SPI driver's spi_sifive_xfer() already handles full-duplex
+ * correctly — we just need to pass both TX and RX buffers.
+ */
+
+/* Circular buffer for data received during writes */
+#define WRITE_RX_BUF_SIZE  512
+static uint8_t write_rx_buf[WRITE_RX_BUF_SIZE];
+static uint16_t write_rx_head;  /* Write position */
+static uint16_t write_rx_tail;  /* Read position */
+static uint16_t write_rx_count; /* Bytes available */
 
 static int bno_spi_read(uint8_t *buf, uint16_t len)
 {
+	/* First check if we have data captured during writes */
+	if (write_rx_count > 0) {
+		uint16_t copy = (write_rx_count < len) ? write_rx_count : len;
+		for (uint16_t i = 0; i < copy; i++) {
+			buf[i] = write_rx_buf[write_rx_tail];
+			write_rx_tail = (write_rx_tail + 1) % WRITE_RX_BUF_SIZE;
+		}
+		write_rx_count -= copy;
+		/* Pad remainder with zeros if needed */
+		if (copy < len) {
+			memset(buf + copy, 0, len - copy);
+		}
+		return 0;
+	}
+
+	/* Normal SPI read (sends zeros on MOSI, captures MISO) */
 	struct spi_buf rx = {.buf = buf, .len = len};
 	struct spi_buf_set rx_set = {.buffers = &rx, .count = 1};
 	return spi_read(spi_dev, &bno_spi_cfg, &rx_set);
@@ -61,9 +92,38 @@ static int bno_spi_read(uint8_t *buf, uint16_t len)
 
 static int bno_spi_write(uint8_t *buf, uint16_t len)
 {
+	/* Full-duplex: send TX data while capturing MISO into write_rx_buf */
+	uint8_t rx_tmp[128];
+	uint16_t rx_len = (len < sizeof(rx_tmp)) ? len : sizeof(rx_tmp);
+
 	struct spi_buf tx = {.buf = buf, .len = len};
 	struct spi_buf_set tx_set = {.buffers = &tx, .count = 1};
-	return spi_write(spi_dev, &bno_spi_cfg, &tx_set);
+	struct spi_buf rx = {.buf = rx_tmp, .len = rx_len};
+	struct spi_buf_set rx_set = {.buffers = &rx, .count = 1};
+
+	int ret = spi_transceive(spi_dev, &bno_spi_cfg, &tx_set, &rx_set);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* Store captured MISO data (skip if all 0xFF — no valid data) */
+	bool has_data = false;
+	for (uint16_t i = 0; i < rx_len; i++) {
+		if (rx_tmp[i] != 0xFF && rx_tmp[i] != 0x00) {
+			has_data = true;
+			break;
+		}
+	}
+
+	if (has_data && (write_rx_count + rx_len <= WRITE_RX_BUF_SIZE)) {
+		for (uint16_t i = 0; i < rx_len; i++) {
+			write_rx_buf[write_rx_head] = rx_tmp[i];
+			write_rx_head = (write_rx_head + 1) % WRITE_RX_BUF_SIZE;
+		}
+		write_rx_count += rx_len;
+	}
+
+	return 0;
 }
 
 /* ---- SH-2 HAL Implementation ---- */

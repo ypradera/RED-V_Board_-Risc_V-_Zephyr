@@ -304,20 +304,16 @@ void bno085_task(void *p1, void *p2, void *p3)
 	#define BIO_INTERVAL_US  20000  /* 50 Hz */
 
 	rc = enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
-	printk("[bno085] Rotation vector (orientation): %s\n",
-	       rc == SH2_OK ? "OK" : "FAIL");
+	printk("[bno085] Rotation vector: %s\n", rc == SH2_OK ? "OK" : "FAIL");
 
 	rc = enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
-	printk("[bno085] Gyroscope (angular velocity):  %s\n",
-	       rc == SH2_OK ? "OK" : "FAIL");
+	printk("[bno085] Gyroscope: %s\n", rc == SH2_OK ? "OK" : "FAIL");
 
 	rc = enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
-	printk("[bno085] Linear accel (no gravity):     %s\n",
-	       rc == SH2_OK ? "OK" : "FAIL");
+	printk("[bno085] Linear accel: %s\n", rc == SH2_OK ? "OK" : "FAIL");
 
 	rc = enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
-	printk("[bno085] Gravity vector:                %s\n",
-	       rc == SH2_OK ? "OK" : "FAIL");
+	printk("[bno085] Gravity: %s\n", rc == SH2_OK ? "OK" : "FAIL");
 
 	needs_report_setup = false;
 	init_complete = true;

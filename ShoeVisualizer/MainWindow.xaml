@@ -1,0 +1,116 @@
+<Window x:Class="ShoeVisualizer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="BNO085 Biomechanics — Gait Analysis"
+        Height="800" Width="1300"
+        Background="#1a1a2e">
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="220"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="350"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Left Panel: Connection + Raw Data -->
+        <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="8">
+                <TextBlock Text="IMU Gait Analyzer"
+                           FontSize="15" FontWeight="Bold" Foreground="#e94560" Margin="0,0,0,8"/>
+
+                <TextBlock Text="Serial Port" Foreground="White" FontSize="11" Margin="0,3"/>
+                <ComboBox x:Name="PortCombo" Margin="0,2" FontSize="11"/>
+                <Button x:Name="ConnectBtn" Content="Connect" Click="ConnectBtn_Click"
+                        Margin="0,4" Padding="4" Background="#0f3460" Foreground="White" FontSize="11"/>
+                <TextBlock x:Name="StatusText" Text="Disconnected" Foreground="#e94560" FontSize="11" Margin="0,3"/>
+
+                <!-- Foot Angles -->
+                <TextBlock Text="FOOT ANGLES" Foreground="#e94560" FontWeight="Bold" Margin="0,12,0,3" FontSize="12"/>
+                <TextBlock x:Name="PitchText" Text="Pitch: 0°" Foreground="#FFD700" FontFamily="Consolas" FontSize="14" FontWeight="Bold"/>
+                <TextBlock Text="  ↑ Dorsiflexion / ↓ Plantarflexion" Foreground="Gray" FontSize="9"/>
+                <TextBlock x:Name="RollText" Text="Roll: 0°" Foreground="#00FF7F" FontFamily="Consolas" FontSize="14" FontWeight="Bold" Margin="0,4,0,0"/>
+                <TextBlock Text="  ← Inversion / → Eversion" Foreground="Gray" FontSize="9"/>
+                <TextBlock x:Name="YawText" Text="Yaw: 0°" Foreground="#00BFFF" FontFamily="Consolas" FontSize="14" FontWeight="Bold" Margin="0,4,0,0"/>
+                <TextBlock Text="  Foot rotation" Foreground="Gray" FontSize="9"/>
+
+                <!-- Gait Events -->
+                <TextBlock Text="GAIT EVENTS" Foreground="#e94560" FontWeight="Bold" Margin="0,12,0,3" FontSize="12"/>
+                <TextBlock x:Name="GaitPhaseText" Text="Phase: —" Foreground="White" FontFamily="Consolas" FontSize="13" FontWeight="Bold"/>
+                <TextBlock x:Name="StepCountText" Text="Steps: 0" Foreground="White" FontFamily="Consolas" FontSize="13"/>
+                <TextBlock x:Name="CadenceText" Text="Cadence: — steps/min" Foreground="White" FontFamily="Consolas" FontSize="11"/>
+                <TextBlock x:Name="StrideTimeText" Text="Stride: — ms" Foreground="White" FontFamily="Consolas" FontSize="11"/>
+
+                <!-- Raw IMU -->
+                <TextBlock Text="RAW IMU" Foreground="#16c79a" FontWeight="Bold" Margin="0,12,0,3" FontSize="11"/>
+                <TextBlock x:Name="QuatText" Text="Q: —" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+                <TextBlock x:Name="GyroText" Text="G: —" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+                <TextBlock x:Name="AccelText" Text="A: —" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+                <TextBlock x:Name="GravText" Text="V: —" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+
+                <!-- Environment -->
+                <TextBlock Text="ENVIRONMENT" Foreground="#16c79a" FontWeight="Bold" Margin="0,10,0,3" FontSize="11"/>
+                <TextBlock x:Name="TempText" Text="Temp: —" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+                <TextBlock x:Name="LuxText" Text="Lux: —" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+                <TextBlock x:Name="FpsText" Text="FPS: 0" Foreground="Gray" FontFamily="Consolas" FontSize="9" Margin="0,5,0,0"/>
+                <TextBlock x:Name="PacketText" Text="Packets: 0" Foreground="Gray" FontFamily="Consolas" FontSize="9"/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Center: 3D Viewport -->
+        <Border Grid.Column="1" Background="#16213e" Margin="3">
+            <Viewport3D x:Name="Viewport">
+                <Viewport3D.Camera>
+                    <PerspectiveCamera Position="15,10,20" LookDirection="-15,-10,-20"
+                                       UpDirection="0,1,0" FieldOfView="45"/>
+                </Viewport3D.Camera>
+                <ModelVisual3D>
+                    <ModelVisual3D.Content>
+                        <Model3DGroup>
+                            <AmbientLight Color="#505050"/>
+                            <DirectionalLight Color="White" Direction="-1,-1,-1"/>
+                            <DirectionalLight Color="#606060" Direction="1,0.5,0.5"/>
+                        </Model3DGroup>
+                    </ModelVisual3D.Content>
+                </ModelVisual3D>
+                <ModelVisual3D x:Name="GridVisual"/>
+                <ModelVisual3D x:Name="ShoeVisual"/>
+            </Viewport3D>
+        </Border>
+
+        <!-- Right Panel: Strip Charts -->
+        <Grid Grid.Column="2" Margin="3">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <!-- Pitch Chart -->
+            <Border Grid.Row="0" Background="#0d1b2a" Margin="0,0,0,2" CornerRadius="3">
+                <Grid>
+                    <TextBlock Text="Pitch (Dorsi/Plantar)" Foreground="#FFD700" FontSize="10"
+                               FontWeight="Bold" Margin="5,3" VerticalAlignment="Top"/>
+                    <Canvas x:Name="PitchChart" Margin="5,20,5,5" ClipToBounds="True"/>
+                </Grid>
+            </Border>
+
+            <!-- Roll Chart -->
+            <Border Grid.Row="1" Background="#0d1b2a" Margin="0,0,0,2" CornerRadius="3">
+                <Grid>
+                    <TextBlock Text="Roll (Inversion/Eversion)" Foreground="#00FF7F" FontSize="10"
+                               FontWeight="Bold" Margin="5,3" VerticalAlignment="Top"/>
+                    <Canvas x:Name="RollChart" Margin="5,20,5,5" ClipToBounds="True"/>
+                </Grid>
+            </Border>
+
+            <!-- Acceleration Z Chart (heel strikes) -->
+            <Border Grid.Row="2" Background="#0d1b2a" Margin="0,0,0,0" CornerRadius="3">
+                <Grid>
+                    <TextBlock Text="Accel Z — Heel Strike Detection" Foreground="#FF6B6B" FontSize="10"
+                               FontWeight="Bold" Margin="5,3" VerticalAlignment="Top"/>
+                    <Canvas x:Name="AccelZChart" Margin="5,20,5,5" ClipToBounds="True"/>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

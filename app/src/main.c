@@ -592,89 +592,21 @@ void workq_task(void *p1, void *p2, void *p3)
 #define WORKQ_PRIO   6
 
 /* ==========================================================
- * I2C Sensor Tasks (SHTC3, OPT4048, BNO085)
+ * I2C Sensor Tasks (SHTC3, OPT4048)
  *
  * All sensors share the I2C bus on GPIO 12 (SDA) / GPIO 13 (SCL).
  * A mutex protects bus access so tasks don't corrupt each other.
  *
- * FE310 I2C DRIVER BUG: The SiFive driver does NOT left-shift
- * the 7-bit address. Confirmed via Saleae logic analyzer.
- * Workaround: pass (addr << 1) for all I2C calls.
+ * The Zephyr SiFive I2C driver was patched to fix:
+ *   1. Address left-shift (Zephyr issue #25713)
+ *   2. STOP after NACK (prevents bus hang)
+ *   3. Timeouts on busy-wait loops
+ *   4. Return value check in read_msg
+ * No application-level workarounds needed anymore.
  * ==========================================================
  */
-#define I2C_SHIFTED(addr7)  ((addr7) << 1)
 
 K_MUTEX_DEFINE(i2c_bus_mutex);
-
-/*
- * FE310 I2C bus recovery.
- * The SiFive I2C controller hangs after several transactions,
- * issuing a START with no follow-up. Full controller re-init
- * clears all pending state.
- *
- * OpenCores I2C register map (byte-addressed on FE310):
- *   0x00 = PRESCALE_LO
- *   0x04 = PRESCALE_HI
- *   0x08 = CTR (control: enable, interrupt enable)
- *   0x0C = TX/RX data
- *   0x10 = CMD/STATUS
- */
-#define I2C0_BASE     0x10016000
-#define I2C_PRE_LO    0x00
-#define I2C_PRE_HI    0x04
-#define I2C_CTR       0x08
-#define I2C_CMD       0x10
-
-/*
- * FE310 I2C bus recovery.
- *
- * The SiFive I2C controller (OpenCores) can get stuck with a
- * pending START. Before each transaction, ensure the controller
- * is idle by checking the status register and sending a STOP
- * if the bus is busy.
- *
- * Called BEFORE each mutex lock (not after unlock).
- */
-#define I2C0_BASE  0x10016000
-#define I2C_CMD    0x10  /* Command/Status register (byte offset) */
-#define I2C_STA_BUSY   BIT(6)  /* Bus busy */
-#define I2C_STA_TIP    BIT(1)  /* Transfer in progress */
-#define I2C_CMD_STOP   BIT(6)  /* Generate STOP */
-
-/*
- * Full I2C controller re-init.
- * The FE310 OpenCores I2C controller hangs after ~5 transactions.
- * The only reliable fix: completely re-initialize the controller
- * before each transaction.
- *
- * Prescaler for 100kHz: (16MHz / (100kHz * 5)) - 1 = 31 = 0x1F
- */
-static void i2c_reinit(void)
-{
-	volatile uint8_t *base = (volatile uint8_t *)I2C0_BASE;
-
-	/* Disable controller */
-	base[0x08] = 0x00;  /* CTR = 0 (disable) */
-	k_busy_wait(10);
-
-	/* Set prescaler for 400kHz: (16MHz / (400kHz * 5)) - 1 = 7 */
-	base[0x00] = 0x07;  /* PRESCALE_LO */
-	base[0x04] = 0x00;  /* PRESCALE_HI */
-
-	/* Re-enable */
-	base[0x08] = 0x80;  /* CTR = EN */
-	k_busy_wait(10);
-}
-
-static void i2c_bus_recover(void)
-{
-	i2c_reinit();
-}
-
-static inline void i2c_bus_settle(void)
-{
-	k_busy_wait(100);
-}
 
 /* Shared I2C bus init — sets up IOF pins (FE310 pinctrl workaround) */
 static const struct device *i2c_bus_init(void)
@@ -708,7 +640,7 @@ void shtc3_task(void *p1, void *p2, void *p3)
 	/* Wakeup */
 	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 	uint8_t wakeup[2] = {0x35, 0x17};
-	int ret = i2c_write(i2c, wakeup, 2, I2C_SHIFTED(0x70));
+	int ret = i2c_write(i2c, wakeup, 2, 0x70);
 	k_mutex_unlock(&i2c_bus_mutex);
 	if (ret != 0) {
 		TPRINTK(PG_I2C, "[shtc3] Wakeup failed: %d\n", ret);
@@ -720,7 +652,7 @@ void shtc3_task(void *p1, void *p2, void *p3)
 	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 	uint8_t id_cmd[2] = {0xEF, 0xC8};
 	uint8_t id_buf[3];
-	ret = i2c_write_read(i2c, I2C_SHIFTED(0x70), id_cmd, 2, id_buf, 3);
+	ret = i2c_write_read(i2c, 0x70, id_cmd, 2, id_buf, 3);
 	k_mutex_unlock(&i2c_bus_mutex);
 	if (ret != 0) {
 		TPRINTK(PG_I2C, "[shtc3] ID read failed: %d\n", ret);
@@ -733,27 +665,23 @@ void shtc3_task(void *p1, void *p2, void *p3)
 
 	while (1) {
 		/* Wakeup + start measurement (short bus access) */
-		i2c_bus_recover();
 		k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 		uint8_t wake[2] = {0x35, 0x17};
-		i2c_write(i2c, wake, 2, I2C_SHIFTED(0x70));
+		i2c_write(i2c, wake, 2, 0x70);
 		uint8_t meas[2] = {0x78, 0x66};
-		i2c_write(i2c, meas, 2, I2C_SHIFTED(0x70));
+		i2c_write(i2c, meas, 2, 0x70);
 		k_mutex_unlock(&i2c_bus_mutex);
-		i2c_bus_settle();
 
 		/* Wait for measurement OFF the bus */
 		k_msleep(15);
 
 		/* Read result + sleep sensor */
-		i2c_bus_recover();
 		k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 		uint8_t data[6];
-		ret = i2c_read(i2c, data, 6, I2C_SHIFTED(0x70));
+		ret = i2c_read(i2c, data, 6, 0x70);
 		uint8_t slp[2] = {0xB0, 0x98};
-		i2c_write(i2c, slp, 2, I2C_SHIFTED(0x70));
+		i2c_write(i2c, slp, 2, 0x70);
 		k_mutex_unlock(&i2c_bus_mutex);
-		i2c_bus_settle();
 
 		if (ret == 0) {
 			uint16_t raw_t = (data[0] << 8) | data[1];
@@ -801,7 +729,7 @@ void opt4048_task(void *p1, void *p2, void *p3)
 	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 	uint8_t id_reg = 0x11;
 	uint8_t id_raw[2];
-	int ret = i2c_write_read(i2c, I2C_SHIFTED(0x44), &id_reg, 1, id_raw, 2);
+	int ret = i2c_write_read(i2c, 0x44, &id_reg, 1, id_raw, 2);
 	k_mutex_unlock(&i2c_bus_mutex);
 
 	if (ret != 0) {
@@ -816,11 +744,10 @@ void opt4048_task(void *p1, void *p2, void *p3)
 	k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 	uint16_t cfg = (0x0C << 10) | (0x06 << 6) | (0x03 << 4);
 	uint8_t cfg_buf[3] = {0x0A, cfg >> 8, cfg & 0xFF};
-	i2c_write(i2c, cfg_buf, 3, I2C_SHIFTED(0x44));
+	i2c_write(i2c, cfg_buf, 3, 0x44);
 	uint8_t set_ptr = 0x02;
-	i2c_write(i2c, &set_ptr, 1, I2C_SHIFTED(0x44));
+	i2c_write(i2c, &set_ptr, 1, 0x44);
 	k_mutex_unlock(&i2c_bus_mutex);
-	i2c_bus_settle();
 
 	TPRINTK(PG_I2C, "[opt4048] Configured\n");
 	k_msleep(150);
@@ -829,23 +756,19 @@ void opt4048_task(void *p1, void *p2, void *p3)
 
 	while (1) {
 		/* Re-set register pointer each time to avoid stale state */
-		i2c_bus_recover();
 		k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 		uint8_t set_reg = 0x02;
-		i2c_write(i2c, &set_reg, 1, I2C_SHIFTED(0x44));
+		i2c_write(i2c, &set_reg, 1, 0x44);
 		k_mutex_unlock(&i2c_bus_mutex);
-		i2c_bus_settle();
 
 		/* Wait 100ms for OPT4048 to prepare data */
 		k_msleep(100);
 
 		/* Now read */
-		i2c_bus_recover();
 		k_mutex_lock(&i2c_bus_mutex, K_FOREVER);
 		uint8_t raw[4];
-		ret = i2c_read(i2c, raw, 4, I2C_SHIFTED(0x44));
+		ret = i2c_read(i2c, raw, 4, 0x44);
 		k_mutex_unlock(&i2c_bus_mutex);
-		i2c_bus_settle();
 
 		if (ret == 0) {
 			uint32_t y = opt4048_decode_ch(
@@ -914,7 +837,6 @@ K_THREAD_DEFINE(workq_tid, WORKQ_STACK,
 		WORKQ_PRIO, 0, 3000);
 */
 
-/* I2C disabled — focusing on BNO085
 K_THREAD_DEFINE(shtc3_tid, SHTC3_STACK,
 		shtc3_task, NULL, NULL, NULL,
 		SHTC3_PRIO, 0, 1000);
@@ -922,7 +844,6 @@ K_THREAD_DEFINE(shtc3_tid, SHTC3_STACK,
 K_THREAD_DEFINE(opt4048_tid, OPT4048_STACK,
 		opt4048_task, NULL, NULL, NULL,
 		OPT4048_PRIO, 0, 1000);
-*/
 
 K_THREAD_DEFINE(bno085_tid, BNO085_STACK,
 		bno085_task, NULL, NULL, NULL,

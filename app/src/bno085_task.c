@@ -1,16 +1,22 @@
 /*
  * BNO085 IMU Task — SPI mode
  *
- * Uses the CEVA SH-2 library for SHTP protocol handling.
- * SPI eliminates the 1.7s clock stretching issue seen with I2C.
+ * HAL implementation matches the Adafruit BNO08x Arduino library:
+ *   - Two-phase SPI read: 4-byte header → wait INTN → full packet
+ *   - Half-duplex write (no circular buffer, no MISO capture)
+ *   - Blocking INTN wait (500ms timeout with auto hardware reset)
+ *   - SPI Mode 3 (CPOL=1, CPHA=1) at 1 MHz
  *
- * Wiring (RED-V header pins):
- *   D10 (GPIO 2) → CS
- *   D11 (GPIO 3) → MOSI (SDA/SDI on BNO085)
- *   D12 (GPIO 4) → MISO (SDO/ADO on BNO085)
- *   D13 (GPIO 5) → SCK  (SCL on BNO085)
- *   BNO085 PS0   → 3.3V (SPI mode select)
- *   BNO085 PS1   → GND  (SPI mode select)
+ * Wiring (RED-V silkscreen):
+ *   "8"  (GPIO 0) → RST
+ *   "9"  (GPIO 1) → INT
+ *   "10" (GPIO 2) → CS
+ *   "11" (GPIO 3) → DI  (MOSI)
+ *   "12" (GPIO 4) → SDA (MISO)
+ *   "13" (GPIO 5) → SCL (SCK)
+ *   3.3V → VIN
+ *   GND  → GND
+ *   PS0/PS1 solder bridges closed (SPI mode)
  */
 
 #include <zephyr/kernel.h>
@@ -25,66 +31,25 @@
 #include "sh2_err.h"
 #include "sh2_SensorValue.h"
 
-/*
- * Pin mapping (RED-V silkscreen → FE310 GPIO):
- *   "8"  = GPIO 0 = RST
- *   "9"  = GPIO 1 = INT
- *   "10" = GPIO 2 = CS  (SPI1 CS0 via IOF)
- *   "11" = GPIO 3 = MOSI (SPI1 DQ0 via IOF)
- *   "12" = GPIO 4 = MISO (SPI1 DQ1 via IOF)
- *   "13" = GPIO 5 = SCK  (SPI1 SCK via IOF)
- */
 #define BNO_RST_PIN  0   /* GPIO 0 = RED-V "8" */
 #define BNO_INT_PIN  1   /* GPIO 1 = RED-V "9" */
-#define GPIO_BASE_ADDR 0x10012000
 
-/* SPI device: SPI1 on the FE310 */
 static const struct device *spi_dev;
 static const struct device *gpio_dev;
 
+/* SPI Mode 3, 1 MHz (matches Adafruit library) */
 static struct spi_config bno_spi_cfg = {
-	.frequency = 3000000,  /* 3 MHz */
+	.frequency = 1000000,
 	.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) |
 		     SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_TRANSFER_MSB,
 	.slave = 0,
-	.cs = { .gpio = { 0 } },  /* Use hardware CS (GPIO 2 via IOF) */
+	.cs = { .gpio = { 0 } },
 };
 
-/* ---- SPI helpers (full-duplex) ----
- *
- * BNO085 SHTP over SPI is full-duplex: the sensor sends data on MISO
- * even during host writes. We must capture this data or the SHTP
- * flow control breaks and the sensor stops sending after ~5 seconds.
- *
- * The SiFive SPI driver's spi_sifive_xfer() already handles full-duplex
- * correctly — we just need to pass both TX and RX buffers.
- */
-
-/* Circular buffer for data received during writes */
-#define WRITE_RX_BUF_SIZE  512
-static uint8_t write_rx_buf[WRITE_RX_BUF_SIZE];
-static uint16_t write_rx_head;  /* Write position */
-static uint16_t write_rx_tail;  /* Read position */
-static uint16_t write_rx_count; /* Bytes available */
+/* ---- SPI helpers (half-duplex, matching Adafruit) ---- */
 
 static int bno_spi_read(uint8_t *buf, uint16_t len)
 {
-	/* First check if we have data captured during writes */
-	if (write_rx_count > 0) {
-		uint16_t copy = (write_rx_count < len) ? write_rx_count : len;
-		for (uint16_t i = 0; i < copy; i++) {
-			buf[i] = write_rx_buf[write_rx_tail];
-			write_rx_tail = (write_rx_tail + 1) % WRITE_RX_BUF_SIZE;
-		}
-		write_rx_count -= copy;
-		/* Pad remainder with zeros if needed */
-		if (copy < len) {
-			memset(buf + copy, 0, len - copy);
-		}
-		return 0;
-	}
-
-	/* Normal SPI read (sends zeros on MOSI, captures MISO) */
 	struct spi_buf rx = {.buf = buf, .len = len};
 	struct spi_buf_set rx_set = {.buffers = &rx, .count = 1};
 	return spi_read(spi_dev, &bno_spi_cfg, &rx_set);
@@ -92,38 +57,39 @@ static int bno_spi_read(uint8_t *buf, uint16_t len)
 
 static int bno_spi_write(uint8_t *buf, uint16_t len)
 {
-	/* Full-duplex: send TX data while capturing MISO into write_rx_buf */
-	uint8_t rx_tmp[128];
-	uint16_t rx_len = (len < sizeof(rx_tmp)) ? len : sizeof(rx_tmp);
-
 	struct spi_buf tx = {.buf = buf, .len = len};
 	struct spi_buf_set tx_set = {.buffers = &tx, .count = 1};
-	struct spi_buf rx = {.buf = rx_tmp, .len = rx_len};
-	struct spi_buf_set rx_set = {.buffers = &rx, .count = 1};
+	return spi_write(spi_dev, &bno_spi_cfg, &tx_set);
+}
 
-	int ret = spi_transceive(spi_dev, &bno_spi_cfg, &tx_set, &rx_set);
-	if (ret != 0) {
-		return ret;
-	}
+/* ---- Hardware reset (matches Adafruit: HIGH-LOW-HIGH 10ms each) ---- */
 
-	/* Store captured MISO data (skip if all 0xFF — no valid data) */
-	bool has_data = false;
-	for (uint16_t i = 0; i < rx_len; i++) {
-		if (rx_tmp[i] != 0xFF && rx_tmp[i] != 0x00) {
-			has_data = true;
-			break;
+static void hal_hardware_reset(void)
+{
+	gpio_pin_set(gpio_dev, BNO_RST_PIN, 1);
+	k_msleep(10);
+	gpio_pin_set(gpio_dev, BNO_RST_PIN, 0);
+	k_msleep(10);
+	gpio_pin_set(gpio_dev, BNO_RST_PIN, 1);
+	k_msleep(10);
+}
+
+/*
+ * Wait for INTN to go LOW (BNO085 has data ready).
+ * Polls for up to 500ms. If timeout, performs hardware reset.
+ * Matches Adafruit spihal_wait_for_int() exactly.
+ */
+static bool hal_wait_for_int(void)
+{
+	for (int i = 0; i < 500; i++) {
+		if (gpio_pin_get(gpio_dev, BNO_INT_PIN) == 0) {
+			return true;
 		}
+		k_msleep(1);
 	}
-
-	if (has_data && (write_rx_count + rx_len <= WRITE_RX_BUF_SIZE)) {
-		for (uint16_t i = 0; i < rx_len; i++) {
-			write_rx_buf[write_rx_head] = rx_tmp[i];
-			write_rx_head = (write_rx_head + 1) % WRITE_RX_BUF_SIZE;
-		}
-		write_rx_count += rx_len;
-	}
-
-	return 0;
+	/* Timeout — reset the BNO085 */
+	hal_hardware_reset();
+	return false;
 }
 
 /* ---- SH-2 HAL Implementation ---- */
@@ -142,32 +108,17 @@ static int bno_hal_open(sh2_Hal_t *self)
 		return SH2_ERR;
 	}
 
-	/* Configure RST as output, INT as input */
 	gpio_pin_configure(gpio_dev, BNO_RST_PIN, GPIO_OUTPUT_ACTIVE);
 	gpio_pin_configure(gpio_dev, BNO_INT_PIN, GPIO_INPUT | GPIO_PULL_UP);
 
-	printk("[bno085] SPI1 ready, resetting BNO085...\n");
+	printk("[bno085] Resetting BNO085...\n");
+	hal_hardware_reset();
 
-	/* Hardware reset sequence:
-	 *   RST LOW for 10ms → RST HIGH → wait for boot (~300ms)
-	 */
-	gpio_pin_set(gpio_dev, BNO_RST_PIN, 0);  /* Assert reset */
-	k_msleep(10);
-	gpio_pin_set(gpio_dev, BNO_RST_PIN, 1);  /* Release reset */
-	k_msleep(300);  /* Wait for BNO085 to boot */
-
-	/* Wait for INT to go low (BNO085 signals ready) */
 	printk("[bno085] Waiting for INT...\n");
-	int timeout = 100;  /* 100 * 10ms = 1 second max */
-	while (timeout-- > 0) {
-		if (gpio_pin_get(gpio_dev, BNO_INT_PIN) == 0) {
-			printk("[bno085] INT asserted — BNO085 ready!\n");
-			break;
-		}
-		k_msleep(10);
-	}
-	if (timeout <= 0) {
-		printk("[bno085] INT timeout (may still work)\n");
+	if (hal_wait_for_int()) {
+		printk("[bno085] INT asserted — ready!\n");
+	} else {
+		printk("[bno085] INT timeout\n");
 	}
 
 	return SH2_OK;
@@ -177,49 +128,64 @@ static void bno_hal_close(sh2_Hal_t *self)
 {
 }
 
+/*
+ * hal_read: Two-phase SPI read (matches Adafruit spihal_read exactly).
+ *
+ *   1. Wait for INTN LOW
+ *   2. Read 4-byte SHTP header (one CS transaction)
+ *   3. Parse packet length from header
+ *   4. Wait for INTN LOW again
+ *   5. Read full packet (second CS transaction — BNO085 re-sends header)
+ */
 static int bno_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
 			uint32_t *t_us)
 {
-	/* Only read when INT is asserted (low) — BNO085 has data */
-	if (gpio_pin_get(gpio_dev, BNO_INT_PIN) != 0) {
-		k_msleep(1);
-		return 0;  /* No data ready */
-	}
-
-	/* Read full packet in one transaction.
-	 * SHTP over SPI: the first 4 bytes are the header,
-	 * followed by the payload. Read it all at once. */
-	uint16_t read_len = (len < 256) ? len : 256;
-	memset(pBuffer, 0, read_len);
-
-	if (bno_spi_read(pBuffer, read_len) != 0) {
+	/* Step 1: Wait for INTN */
+	if (!hal_wait_for_int()) {
 		return 0;
 	}
 
-	/* Parse packet length from header */
-	uint16_t packet_len = (uint16_t)(pBuffer[0] | (pBuffer[1] << 8));
-	packet_len &= 0x7FFF;
-
-	if (packet_len == 0 || packet_len == 0x7FFF) {
+	/* Step 2: Read 4-byte SHTP header */
+	if (bno_spi_read(pBuffer, 4) != 0) {
 		return 0;
 	}
 
-	if (packet_len > read_len) {
-		packet_len = read_len;
+	/* Step 3: Parse packet length */
+	uint16_t packet_size = (uint16_t)pBuffer[0] | ((uint16_t)pBuffer[1] << 8);
+	packet_size &= ~0x8000;  /* Clear continuation bit */
+
+	if (packet_size == 0) {
+		return 0;
+	}
+
+	if (packet_size > len) {
+		return 0;  /* Adafruit returns 0 if packet > buffer */
+	}
+
+	/* Step 4: Wait for INTN again */
+	if (!hal_wait_for_int()) {
+		return 0;
+	}
+
+	/* Step 5: Read full packet */
+	if (bno_spi_read(pBuffer, packet_size) != 0) {
+		return 0;
 	}
 
 	*t_us = (uint32_t)(k_uptime_get() * 1000);
-	return packet_len;
+	return packet_size;
 }
 
-static uint32_t write_count;
-
+/*
+ * hal_write: Wait for INTN, then write (matches Adafruit spihal_write).
+ * Half-duplex — MISO data during writes is discarded.
+ */
 static int bno_hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
 {
-	write_count++;
-	int ret = bno_spi_write(pBuffer, len);
-	if (ret != 0) {
-		printk("[bno085] SPI write failed: %d (len=%d)\n", ret, len);
+	if (!hal_wait_for_int()) {
+		return 0;
+	}
+	if (bno_spi_write(pBuffer, len) != 0) {
 		return 0;
 	}
 	return len;
@@ -234,19 +200,13 @@ static uint32_t bno_hal_getTimeUs(sh2_Hal_t *self)
 
 static volatile bool sensor_data_ready;
 static sh2_SensorValue_t latest_value;
-
-static volatile bool needs_report_setup;
-static volatile bool init_complete;
+static volatile bool was_reset;
 
 static void sh2_event_callback(void *cookie, sh2_AsyncEvent_t *pEvent)
 {
 	if (pEvent->eventId == SH2_RESET) {
-		if (init_complete) {
-			printk("[bno085] Reset detected — will re-enable reports\n");
-			needs_report_setup = true;
-		} else {
-			printk("[bno085] Initial reset (expected)\n");
-		}
+		was_reset = true;
+		printk("[bno085] Reset detected\n");
 	}
 }
 
@@ -256,11 +216,17 @@ static void sh2_sensor_callback(void *cookie, sh2_SensorEvent_t *pEvent)
 	sensor_data_ready = true;
 }
 
-static int enable_report(uint8_t sensor_id, uint32_t interval_us)
+static void enable_reports(void)
 {
 	sh2_SensorConfig_t config = {0};
-	config.reportInterval_us = interval_us;
-	return sh2_setSensorConfig(sensor_id, &config);
+	config.reportInterval_us = 20000;  /* 50 Hz */
+
+	sh2_setSensorConfig(SH2_ROTATION_VECTOR, &config);
+	sh2_setSensorConfig(SH2_GYROSCOPE_CALIBRATED, &config);
+	sh2_setSensorConfig(SH2_LINEAR_ACCELERATION, &config);
+	sh2_setSensorConfig(SH2_GRAVITY, &config);
+
+	printk("[bno085] Reports enabled at 50 Hz\n");
 }
 
 /* ---- BNO085 Task ---- */
@@ -269,7 +235,7 @@ void bno085_task(void *p1, void *p2, void *p3)
 {
 	static sh2_Hal_t bno_hal;
 
-	printk("[bno085] Starting (SPI mode)...\n");
+	printk("[bno085] Starting (SPI mode, 1 MHz)...\n");
 
 	bno_hal.open      = bno_hal_open;
 	bno_hal.close     = bno_hal_close;
@@ -282,114 +248,38 @@ void bno085_task(void *p1, void *p2, void *p3)
 		printk("[bno085] sh2_open failed: %d\n", rc);
 		return;
 	}
-	printk("[bno085] SH-2 connected via SPI!\n");
+	printk("[bno085] SH-2 connected!\n");
 
 	sh2_ProductIds_t prodIds;
 	rc = sh2_getProdIds(&prodIds);
-	if (rc == SH2_OK) {
-		printk("[bno085] Product entries: %d\n", prodIds.numEntries);
-		if (prodIds.numEntries > 0) {
-			printk("[bno085] SW Version: %d.%d.%d\n",
-			       prodIds.entry[0].swVersionMajor,
-			       prodIds.entry[0].swVersionMinor,
-			       prodIds.entry[0].swVersionPatch);
-		}
+	if (rc == SH2_OK && prodIds.numEntries > 0) {
+		printk("[bno085] SW: %d.%d.%d\n",
+		       prodIds.entry[0].swVersionMajor,
+		       prodIds.entry[0].swVersionMinor,
+		       prodIds.entry[0].swVersionPatch);
 	} else {
-		printk("[bno085] getProdIds failed: %d\n", rc);
+		printk("[bno085] getProdIds: %d\n", rc);
 	}
 
 	sh2_setSensorCallback(sh2_sensor_callback, NULL);
+	enable_reports();
+	was_reset = false;
 
-	/* Enable biomechanics sensor suite at 50 Hz (20ms = 20000us) */
-	#define BIO_INTERVAL_US  20000  /* 50 Hz */
-
-	rc = enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
-	printk("[bno085] Rotation vector: %s\n", rc == SH2_OK ? "OK" : "FAIL");
-
-	rc = enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
-	printk("[bno085] Gyroscope: %s\n", rc == SH2_OK ? "OK" : "FAIL");
-
-	rc = enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
-	printk("[bno085] Linear accel: %s\n", rc == SH2_OK ? "OK" : "FAIL");
-
-	rc = enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
-	printk("[bno085] Gravity: %s\n", rc == SH2_OK ? "OK" : "FAIL");
-
-	needs_report_setup = false;
-	init_complete = true;
 	printk("[bno085] Reading IMU data...\n");
 
-	/* Track data flow to detect stalls */
-	uint32_t last_data_count = 0;
-	int64_t last_data_time = k_uptime_get();
-
-	uint32_t service_count = 0;
 	uint32_t data_count = 0;
 	uint32_t last_print = 0;
 
 	while (1) {
-		/* Re-enable reports after a BNO085 reset */
-		if (needs_report_setup) {
-			needs_report_setup = false;
-			printk("[bno085] Re-enabling reports after reset...\n");
-			k_msleep(100);
-			enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
-			enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
-			enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
-			enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
-			printk("[bno085] Reports re-enabled\n");
+		/* Check for reset (matches Adafruit wasReset() pattern) */
+		if (was_reset) {
+			was_reset = false;
+			printk("[bno085] Re-enabling reports after reset\n");
+			enable_reports();
 		}
 
-		/* Service aggressively — process multiple packets per loop */
+		/* Service SH-2 — one packet per call (matches Adafruit) */
 		sh2_service();
-		service_count++;
-
-		/* Print heartbeat every 10 seconds */
-		uint32_t now = (uint32_t)(k_uptime_get() / 1000);
-		if (now != last_print && (now % 10) == 0) {
-			last_print = now;
-			printk("[bno085] alive: svc=%u data=%u wr=%u INT=%d\n",
-			       service_count, data_count, write_count,
-			       gpio_pin_get(gpio_dev, BNO_INT_PIN));
-		}
-
-		/* Detect data stall — if no new data for 3 seconds, reset BNO085 */
-		if (data_count > last_data_count) {
-			last_data_count = data_count;
-			last_data_time = k_uptime_get();
-		} else if ((k_uptime_get() - last_data_time) > 3000 && data_count > 0) {
-			printk("[bno085] Data stall detected — resetting...\n");
-
-			sh2_close();
-
-			/* Hardware reset */
-			gpio_pin_set(gpio_dev, BNO_RST_PIN, 0);
-			k_msleep(10);
-			gpio_pin_set(gpio_dev, BNO_RST_PIN, 1);
-			k_msleep(300);
-
-			init_complete = false;
-			needs_report_setup = false;
-
-			rc = sh2_open(&bno_hal, sh2_event_callback, NULL);
-			if (rc != SH2_OK) {
-				printk("[bno085] Re-open failed: %d\n", rc);
-				k_msleep(1000);
-				continue;
-			}
-
-			sh2_setSensorCallback(sh2_sensor_callback, NULL);
-			enable_report(SH2_ROTATION_VECTOR, BIO_INTERVAL_US);
-			enable_report(SH2_GYROSCOPE_CALIBRATED, BIO_INTERVAL_US);
-			enable_report(SH2_LINEAR_ACCELERATION, BIO_INTERVAL_US);
-			enable_report(SH2_GRAVITY, BIO_INTERVAL_US);
-
-			init_complete = true;
-			last_data_count = data_count;
-			last_data_time = k_uptime_get();
-			write_count = 0;
-			printk("[bno085] Reset complete, reports re-enabled\n");
-		}
 
 		if (sensor_data_ready) {
 			data_count++;
@@ -397,47 +287,32 @@ void bno085_task(void *p1, void *p2, void *p3)
 
 			switch (latest_value.sensorId) {
 			case SH2_ROTATION_VECTOR: {
-				/* Quaternion: orientation in 3D space
-				 * Values: -1.0 to 1.0, scaled x10000 */
 				int32_t qi = (int32_t)(latest_value.un.rotationVector.i * 10000);
 				int32_t qj = (int32_t)(latest_value.un.rotationVector.j * 10000);
 				int32_t qk = (int32_t)(latest_value.un.rotationVector.k * 10000);
 				int32_t qr = (int32_t)(latest_value.un.rotationVector.real * 10000);
-				int32_t acc = (int32_t)(latest_value.un.rotationVector.accuracy * 100);
-
-				printk("[imu] Quat: i=%d j=%d k=%d r=%d acc=%d\n",
-				       qi, qj, qk, qr, acc);
+				printk("[imu] Q: %d %d %d %d\n", qi, qj, qk, qr);
 				break;
 			}
 			case SH2_GYROSCOPE_CALIBRATED: {
-				/* Angular velocity in rad/s, scaled x100 */
 				int32_t gx = (int32_t)(latest_value.un.gyroscope.x * 100);
 				int32_t gy = (int32_t)(latest_value.un.gyroscope.y * 100);
 				int32_t gz = (int32_t)(latest_value.un.gyroscope.z * 100);
-
-				printk("[imu] Gyro: x=%d y=%d z=%d (x100 rad/s)\n",
-				       gx, gy, gz);
+				printk("[imu] G: %d %d %d\n", gx, gy, gz);
 				break;
 			}
 			case SH2_LINEAR_ACCELERATION: {
-				/* Acceleration without gravity in m/s^2, scaled x100 */
 				int32_t lx = (int32_t)(latest_value.un.linearAcceleration.x * 100);
 				int32_t ly = (int32_t)(latest_value.un.linearAcceleration.y * 100);
 				int32_t lz = (int32_t)(latest_value.un.linearAcceleration.z * 100);
-
-				printk("[imu] LinAcc: x=%d y=%d z=%d (x100 m/s2)\n",
-				       lx, ly, lz);
+				printk("[imu] A: %d %d %d\n", lx, ly, lz);
 				break;
 			}
 			case SH2_GRAVITY: {
-				/* Gravity direction in m/s^2, scaled x100
-				 * At rest: should read ~0,0,981 (9.81 m/s^2 down) */
 				int32_t gvx = (int32_t)(latest_value.un.gravity.x * 100);
 				int32_t gvy = (int32_t)(latest_value.un.gravity.y * 100);
 				int32_t gvz = (int32_t)(latest_value.un.gravity.z * 100);
-
-				printk("[imu] Grav: x=%d y=%d z=%d (x100 m/s2)\n",
-				       gvx, gvy, gvz);
+				printk("[imu] V: %d %d %d\n", gvx, gvy, gvz);
 				break;
 			}
 			default:
@@ -445,6 +320,14 @@ void bno085_task(void *p1, void *p2, void *p3)
 			}
 		}
 
+		/* Heartbeat every 10 seconds */
+		uint32_t now = (uint32_t)(k_uptime_get() / 1000);
+		if (now != last_print && (now % 10) == 0) {
+			last_print = now;
+			printk("[bno085] data=%u\n", data_count);
+		}
+
+		/* 10ms delay (matches Adafruit example loop) */
 		k_msleep(10);
 	}
 }
